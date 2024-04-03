@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import numpy as np
 import torch_topological.nn as ttnn
 numeric = int|float
 
@@ -50,7 +51,7 @@ class TIPINN(nn.Module):
 
     def validate_loss(self, loss, weight):
         if not loss:
-            return 
+            return loss
         
         if loss and not weight:
             raise ValueError("Given loss but no loss weight. Please input loss weight if want to use extra loss function.")
@@ -73,7 +74,6 @@ class TIPINN(nn.Module):
             optimiser.zero_grad()
             outputs = self.forward(X)
             loss = self.loss(y, outputs)
-
             if self.phys_loss:
                 loss += self.phys_loss_weight + self.phys_loss_weight * self.phys_loss(self)
 
@@ -89,7 +89,8 @@ class TIPINN(nn.Module):
 
     def predict(self, X):
         self.eval()
-        out = self.forward(X)
+        with torch.no_grad():
+            out = self.forward(X)
         return out
     
 
@@ -98,25 +99,34 @@ class TIPINN_Cooling(TIPINN):
         self,
         input_dim: int = 1, 
         hidden_dim:int = 200,
-        output_dim:int = 10, 
+        output_dim:int = 1, 
         epochs=1000,
         loss=nn.MSELoss(),
         activation=nn.ReLU(),
         optimizer=torch.optim.Adam,
         lr=1e-3,
+        phys_loss = False,
+        topo_loss = False,
         phys_loss_weight = 1,
         topo_loss_weight = 1
     ) -> None:
         self.Tenv = 25
         self.T0 = 100
         self.R = 0.005
-        self.times = torch.linspace(0, 1000, 1000)
+        self.times = np.linspace(0, 1000, 1000).reshape(-1, 1)
         self.temps = self.cooling_law(time=self.times, Tenv=self.Tenv, T0=self.T0, R=self.R)
+        self.times = torch.from_numpy(self.times).type(torch.float)
 
         # Make training data
-        self.t = torch.linspace(0, 300, 10)
-        self.T = self.cooling_law(time=self.t, Tenv=self.Tenv, T0=self.T0, R=self.R) +  2 * torch.normal(0, 1, size = [10])
+        self.t = np.linspace(0, 300, 10).reshape(-1, 1)
+        self.T = self.cooling_law(time=self.t, Tenv=self.Tenv, T0=self.T0, R=self.R) +  2 * torch.normal(0, 1, size = [10, 1])
+        self.t = torch.from_numpy(self.t).type(torch.float)
         self.cubic_temps = cubic(self.temps)
+
+        if phys_loss:
+            phys_loss = self.phys_loss
+        if topo_loss:
+            topo_loss = self.topological_loss
 
         super().__init__(
             input_dim, 
@@ -127,15 +137,15 @@ class TIPINN_Cooling(TIPINN):
             activation,
             optimizer,
             lr,
-            self.phys_loss(TIPINN(input_dim, hidden_dim, output_dim)),
+            phys_loss,
             phys_loss_weight,
-            self.topological_loss(TIPINN(input_dim, hidden_dim, output_dim)),
+            topo_loss,
             topo_loss_weight
         )
 
     def cooling_law(self, time, Tenv, T0, R):
-        T = Tenv + (T0 - Tenv) * torch.exp(-R * time)
-        return T
+        T = Tenv + (T0 - Tenv) * np.exp(-R * time)
+        return torch.from_numpy(T).type(torch.float)
 
     def topological_loss(self, model):
         ts = torch.linspace(0, 1000, steps=len(self.times)).view(-1,1).requires_grad_(True)
