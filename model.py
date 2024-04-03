@@ -6,8 +6,8 @@ numeric = int|float
 
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-cubic = ttnn.CubicalComplex()
-wasser = ttnn.WassersteinDistance()
+cubic = ttnn.CubicalComplex().to(DEVICE)
+wasser = ttnn.WassersteinDistance().to(DEVICE)
 
 class TIPINN(nn.Module):
     def __init__(
