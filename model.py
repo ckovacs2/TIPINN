@@ -7,7 +7,7 @@ numeric = int|float
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 cubic = ttnn.CubicalComplex().to(DEVICE)
-wasser = ttnn.WassersteinDistance().to(DEVICE)
+bottleneck = ttnn.WassersteinDistance(q = torch.inf).to(DEVICE)
 
 class TIPINN(nn.Module):
     def __init__(
@@ -109,10 +109,11 @@ class TIPINN_Cooling(TIPINN):
         phys_loss = False,
         topo_loss = False,
         phys_loss_weight = 1,
-        topo_loss_weight = 1,
+        topo_loss_weight = 0.5,
         Tenv:float = 25,
         T0:int = 100,
-        R:float = 0.005
+        R:float = 0.005*3,
+        noise_intensity: int = 2
     ) -> None:
         
         # Initial conditions and ground truths
@@ -122,12 +123,13 @@ class TIPINN_Cooling(TIPINN):
         self.times = np.linspace(0, 1000, 1000).reshape(-1, 1)
         self.temps = self.cooling_law(time=self.times, Tenv=Tenv, T0=T0, R=R)
         self.times = torch.from_numpy(self.times).type(torch.float).to(DEVICE)
+        self.cooling = self.original_pde(self.temps)
+        self.cubic_temps = cubic(self.cooling)
 
         # Make training data
         self.t = np.linspace(0, 300, 10).reshape(-1, 1)
-        self.T = self.cooling_law(time=self.t, Tenv=Tenv, T0=T0, R=R) +  2 * torch.normal(0, 1, size = [10, 1]).to(DEVICE)
+        self.T = self.cooling_law(time=self.t, Tenv=Tenv, T0=T0, R=R) +  noise_intensity * torch.normal(0, 1, size = [10, 1]).to(DEVICE)
         self.t = torch.from_numpy(self.t).type(torch.float).to(DEVICE)
-        self.cubic_temps = cubic(self.temps)
 
         if phys_loss:
             phys_loss = self.phys_loss
@@ -152,17 +154,25 @@ class TIPINN_Cooling(TIPINN):
     def cooling_law(self, time, Tenv, T0, R):
         T = Tenv + (T0 - Tenv) * np.exp(-R * time)
         return torch.from_numpy(T).type(torch.float).to(DEVICE)
+    
+    def original_pde(self, temp):
+        return -1 * self.R * (temp - self.Tenv)
+
+    def pde(self, temp, deriv):
+        return self.R*(self.Tenv - temp) - deriv
 
     def topological_loss(self, model):
         ts = torch.linspace(0, 1000, steps=len(self.times)).view(-1,1).requires_grad_(True).to(DEVICE)
         temps = model(ts)
-        dgm = cubic(temps)
-        distance = wasser(self.cubic_temps, dgm)
+        dT = self.to_grad(temps, ts)[0]
+        pde = self.pde(temps, dT)
+        dgm = cubic(pde)
+        distance = bottleneck(self.cubic_temps, dgm)
         return distance
 
     def phys_loss(self, model):
         ts = torch.linspace(0, 1000, steps=len(self.times)).view(-1,1).requires_grad_(True).to(DEVICE)
         temps = model(ts)
         dT = self.to_grad(temps, ts)[0]
-        pde = self.R*(self.Tenv - temps) - dT
+        pde = self.pde(temps, dT)
         return torch.mean(pde**2)
