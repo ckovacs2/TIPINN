@@ -5,10 +5,10 @@ import torch_topological.nn as ttnn
 numeric = int|float
 
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-cubic0 = ttnn.CubicalComplex(dim = 0).to(DEVICE)
-cubic1 = ttnn.CubicalComplex(dim = 1).to(DEVICE)
+cubic = ttnn.CubicalComplex().to(DEVICE)
+cubic.training = False
 metric = ttnn.WassersteinDistance().to(DEVICE)
+metric.training = False
 
 class TIPINN(nn.Module):
     def __init__(
@@ -23,11 +23,12 @@ class TIPINN(nn.Module):
         lr=1e-3,
         phys_loss = None, 
         phys_loss_weight = None,
-        topo_loss = False,
-        topo_loss_weight = None
+        topo_loss = None,
+        topo_loss_weight = None,
+        ols_loss = None,
+        ols_loss_weight = None
     ):
         super().__init__()
-
         self.epochs = epochs
         self.loss = loss
         self.activation = activation
@@ -37,10 +38,13 @@ class TIPINN(nn.Module):
         self.phys_loss_weight = phys_loss_weight
         self.topo_loss = topo_loss
         self.topo_loss_weight = topo_loss_weight
+        self.ols_loss = ols_loss
+        self.ols_loss_weight = ols_loss_weight
 
         # ensure weight is given if loss is given
         self.validate_loss(self.phys_loss, self.phys_loss_weight)
         self.validate_loss(self.topo_loss, self.topo_loss_weight)
+        self.validate_loss(self.ols_loss, self.ols_loss_weight)
         
         self.layers = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
@@ -83,6 +87,9 @@ class TIPINN(nn.Module):
             if self.topo_loss:
                 loss += self.topo_loss_weight * self.topo_loss(self)
 
+            if self.ols_loss:
+                loss += self.ols_loss_weight * self.ols_loss(self)
+
             loss.backward()
             optimiser.step()
             losses.append(loss.item())
@@ -110,33 +117,37 @@ class TIPINN_Cooling(TIPINN):
         lr=1e-3,
         phys_loss = False,
         topo_loss = False,
+        ols_loss = False,
         phys_loss_weight = 1,
         topo_loss_weight = 1,
+        ols_loss_weight = 1,
         Tenv:float = 25,
         T0:int = 100,
         R:float = 0.005*3,
         noise_intensity: int = 2,
-        dim = 0
     ) -> None:
         
         # Initial conditions and ground truths
         self.Tenv = Tenv
         self.T0 = T0
         self.R = R
-        self.dim = dim
-        self.times = np.linspace(0, 1000, 1000).reshape(-1, 1)
-        self.temps = self.cooling_solution(time=self.times, Tenv=Tenv, T0=T0, R=R)
-        self.times = torch.from_numpy(self.times).type(torch.float).to(DEVICE)
+
+        # Ground Truth
+        self.true_times = np.linspace(0, 1000, 1000).reshape(-1, 1)
+        self.true_temps = self.cooling_solution(time=self.true_times, Tenv=Tenv, T0=T0, R=R)
+        self.true_times = torch.from_numpy(self.true_times).type(torch.float).to(DEVICE)
 
         # Make training data
-        self.t = np.linspace(0, 300, 10).reshape(-1, 1)
-        self.T = self.cooling_solution(time=self.t, Tenv=Tenv, T0=T0, R=R) +  noise_intensity * torch.normal(0, 1, size = [10, 1]).to(DEVICE)
-        self.t = torch.from_numpy(self.t).type(torch.float).to(DEVICE)
+        self.approx_times = np.linspace(0, 300, 10).reshape(-1, 1)
+        self.approx_temps = self.cooling_solution(time=self.approx_times, Tenv=Tenv, T0=T0, R=R) +  noise_intensity * torch.normal(0, 1, size = [10, 1]).to(DEVICE)
+        self.approx_times = torch.from_numpy(self.approx_times).type(torch.float).to(DEVICE)
 
         if phys_loss:
             phys_loss = self.phys_loss
         if topo_loss:
             topo_loss = self.topological_loss
+        if ols_loss:
+            ols_loss = self.ols_loss
 
         super().__init__(
             input_dim, 
@@ -151,6 +162,8 @@ class TIPINN_Cooling(TIPINN):
             phys_loss_weight,
             topo_loss,
             topo_loss_weight,
+            ols_loss,
+            ols_loss_weight
         )
 
     def cooling_solution(self, time, Tenv, T0, R):
@@ -161,8 +174,7 @@ class TIPINN_Cooling(TIPINN):
         return self.R * (self.Tenv - temp)
 
     def topological_loss(self, model):
-        cubic = cubic1 if self.dim == 1 else cubic0
-        ts = torch.linspace(0, 1000, steps=len(self.times)).view(-1,1).requires_grad_(True).to(DEVICE)
+        ts = torch.linspace(0, 1000, steps=len(self.true_times)).view(-1,1).requires_grad_(True).to(DEVICE)
         temps = model(ts)
 
         # compute prediction diagram
@@ -179,8 +191,11 @@ class TIPINN_Cooling(TIPINN):
         return distance
 
     def phys_loss(self, model):
-        ts = torch.linspace(0, 1000, steps=len(self.times)).view(-1,1).requires_grad_(True).to(DEVICE)
+        ts = torch.linspace(0, 1000, steps=len(self.true_times)).view(-1,1).requires_grad_(True).to(DEVICE)
         temps = model(ts)
         dT = self.to_grad(temps, ts)[0]
         loss = torch.mean(torch.pow(self.cooling_pde(temps) - dT, 2))
         return loss
+    
+    def ols_loss(self, model):
+        return torch.sum(sum([p.pow(2.) for p in model.parameters()]))
