@@ -143,7 +143,7 @@ class TIPINN_Cooling(TIPINN):
         if phys_loss:
             phys_loss = self.phys_loss
         if topo_loss:
-            topo_loss = self.topological_loss
+            topo_loss = self.topo_loss
         if ols_loss:
             ols_loss = self.ols_loss
 
@@ -171,7 +171,7 @@ class TIPINN_Cooling(TIPINN):
     def cooling_pde(self, temp):
         return self.R * (self.Tenv - temp)
 
-    def topological_loss(self, model):
+    def topo_loss(self, model):
         ts = torch.linspace(0, 1000, steps=len(self.true_times)).view(-1,1).requires_grad_(True).to(DEVICE)
         temps = model(ts)
 
@@ -217,30 +217,25 @@ class TIPINN_Oscillation(TIPINN):
         d:float = 2,
         w0:int = 20,
     ) -> None:
-        
+    
         # Initial conditions and ground truths
-        self.d = d
-        self.w0 = w0
+        self.d = torch.tensor(d, device=DEVICE)
+        self.w0 = torch.tensor(w0, device=DEVICE)
         self.mu = 2*d
         self.k = w0**2
-    
-        # Ground Truth
-        self.true_space = torch.linspace(0,1,500).view(-1,1)
-        self.true_oscillate = self.oscillation_solution(d = self.d, w0=self.w0, x = self.x).to(DEVICE)
-        # define boundary points, for the boundary loss
-        self.t_boundary = torch.tensor(0.).view(-1,1).requires_grad_(True)
 
-        # define training points over the entire domain, for the physics loss
-        self.t_physics = torch.linspace(0,1,30).view(-1,1).requires_grad_(True)
+        # ground truth
+        self.true_space = torch.linspace(0,1,500).view(-1,1).to(DEVICE)
+        self.true_oscillate = self.oscillation_solution(self.true_space).view(-1,1).to(DEVICE)
 
-        # Make training data
+        # slice out a small number of points from the LHS of the domain
         self.approx_space = self.true_space[0:200:20]
-        self.approx_temps = self.true_oscillate[0:200:20]
+        self.approx_oscillate = self.true_oscillate[0:200:20]
 
         if phys_loss:
             phys_loss = self.phys_loss
         if topo_loss:
-            topo_loss = self.topological_loss
+            topo_loss = self.topo_loss
         if ols_loss:
             ols_loss = self.ols_loss
 
@@ -254,40 +249,41 @@ class TIPINN_Oscillation(TIPINN):
             optimizer,
             lr,
             phys_loss,
-            None,
+            1,
             topo_loss,
             topo_loss_weight,
             ols_loss,
             ols_loss_weight
         )
 
-    def oscillation_solution(self, d, w0, x):
+    def oscillation_solution(self, x):
         """Defines the analytical solution to the 1D underdamped harmonic oscillator problem.
         Equations taken from: https://beltoforion.de/en/harmonic_oscillator/"""
-        assert d < w0
-        w = np.sqrt(w0**2-d**2)
-        phi = np.arctan(-d/w)
-        A = 1/(2*np.cos(phi))
+        assert self.d < self.w0
+        w = torch.sqrt(self.w0**2-self.d**2)
+        phi = torch.arctan(-self.d/w)
+        A = 1/(2*torch.cos(phi))
         cos = torch.cos(phi+w*x)
-        sin = torch.sin(phi+w*x)
-        exp = torch.exp(-d*x)
+        exp = torch.exp(-self.d*x)
         y  = exp*2*A*cos
         return y
     
     def oscillation_pde(self, d2udt2, dudt, u):
         return d2udt2 + self.mu*dudt + self.k*u
 
-    def topological_loss(self, model):
+    def topo_loss(self, physics):
         """Notice that for the topological loss, we are only comparing the recovery of the pde without considering boundaries.
         """
-        ts = torch.linspace(0, self.true_space.max(), steps=len(self.true_space)).view(-1,1).requires_grad_(True).to(DEVICE)
-        u = model(ts)
-        dudt = self.to_grad(u, ts)[0]
-        d2udt2 = self.to_grad(dudt, ts)[0]
+        # compute the physics loss
+        u = self(physics)
+        dudt = self.to_grad(u, physics)[0]
+        d2udt2 = self.to_grad(dudt, physics)[0]
         pde_dgm = cubic(self.oscillation_pde(d2udt2, dudt, u))
 
         # compute gradient diagram
-        dudt_recovered = self.to_grad(u, ts)[0]
+        ts = torch.linspace(0,1,len(physics)*10).view(-1,1).requires_grad_(True).to(DEVICE)
+        u_recovered = self(ts)
+        dudt_recovered = self.to_grad(u_recovered, ts)[0]
         d2udt2_recovered = self.to_grad(dudt_recovered, ts)[0]
         grad_dgm = cubic(d2udt2_recovered)
 
@@ -297,46 +293,40 @@ class TIPINN_Oscillation(TIPINN):
         distance = topo_loss.mean()
         return distance
 
-    def phys_loss(self, model):
+    def phys_loss(self, boundary, physics):
         # compute each term of the PINN loss function above
         # using the following hyperparameters:
         lambda1, lambda2 = 1e-1, 1e-4
 
         # compute boundary loss
-        u = model(self.t_boundary)
+        u = self(boundary)
         loss1 = (torch.squeeze(u) - 1)**2
-        dudt = self.to_grad(u, self.t_boundary)[0]
+        dudt = self.to_grad(u, boundary)[0]
         loss2 = (torch.squeeze(dudt) - 0)**2
 
         # compute physics loss
-        u = model(self.t_physics)
-        dudt = torch.autograd.grad(u, self.t_physics, torch.ones_like(u), create_graph=True)[0]
-        d2udt2 = torch.autograd.grad(dudt, self.t_physics, torch.ones_like(dudt), create_graph=True)[0]
-        loss3 = torch.mean((d2udt2 + self.mu*dudt + self.k*u)**2)
+        u = self(physics)
+        dudt = self.to_grad(u, physics)[0]
+        d2udt2 = self.to_grad(dudt, physics)[0]
+        loss3 = torch.mean(self.oscillation_pde(d2udt2, dudt, u)**2)
 
         # backpropagate joint loss, take optimiser step
         loss = loss1 + lambda1*loss2 + lambda2*loss3
         return loss
     
-    def ols_loss(self, model):
-        return torch.sum(sum([p.pow(2.) for p in model.parameters()]))
-    
-    def fit(self, X, y):
+    def fit(self):
         optimiser = self.optimizer(self.parameters(), lr=self.lr)
+        t_boundary = torch.tensor(0.).requires_grad_(True).view(-1,1)
+        t_physics = torch.linspace(0,1,30).requires_grad_(True).view(-1,1)
         self.train()
         losses = []
         for ep in range(self.epochs):
             optimiser.zero_grad()
-            outputs = self.forward(X)
             if self.phys_loss:
-                loss = self.phys_loss(self)
+                loss = self.phys_loss(t_boundary, t_physics)
             else:
-                loss = self.loss(y, outputs)
-                if self.topo_loss:
-                    loss += self.topo_loss_weight * self.topo_loss(self)
-
-                if self.ols_loss:
-                    loss += self.ols_loss_weight * self.ols_loss(self)
+                outputs = self.forward(self.approx_space)
+                loss = torch.mean((self.approx_oscillate - outputs)**2) + self.topo_loss_weight * self.topo_loss(t_physics)
 
             loss.backward()
             optimiser.step()
