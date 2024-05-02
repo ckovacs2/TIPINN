@@ -4,6 +4,8 @@ import numpy as np
 import torch_topological.nn as ttnn
 numeric = int|float
 
+np.random.seed(42)
+
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 cubic = ttnn.CubicalComplex().to(DEVICE)
 cubic.training = False
